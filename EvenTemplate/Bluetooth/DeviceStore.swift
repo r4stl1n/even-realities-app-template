@@ -21,14 +21,18 @@ class DeviceStore {
     ]
     /// Bool settings that survive app restarts (user-facing glasses configuration).
     private static let persistedBoolKeys = [
-        "hey_even_enabled", "hide_builtin_menu_apps",
+        "hey_even_enabled", "hide_builtin_menu_apps", "auto_brightness",
     ]
     /// Int settings that survive app restarts (user-facing glasses configuration).
     private static let persistedIntKeys = [
         "splash_duration_seconds", "dashboard_auto_close_seconds",
+        // Display position — re-pushed to the glasses on every connect, so it
+        // has to survive an app restart or the wearer's calibration is lost.
+        "dashboard_height", "dashboard_depth", "head_up_angle", "brightness",
     ]
     private static let persistedKeyPrefix = "even_template_store_bluetooth_"
 
+    private var brightnessDebounceTask: Task<Void, Never>?
     private var dashboardHeightDebounceTask: Task<Void, Never>?
     private var dashboardDepthDebounceTask: Task<Void, Never>?
 
@@ -160,6 +164,23 @@ class DeviceStore {
         store.remove(category, key)
     }
 
+    /// Brightness and auto-brightness ride the same protobuf field, so one
+    /// debounced send covers both. Coalescing matters here: dragging a slider
+    /// emits a value per pixel, and the old path answered each one with an
+    /// on-glass "Set brightness to N%" text wall followed by `clearDisplay()` —
+    /// a page rebuild per step that fought whatever was on screen. The lens
+    /// visibly changing brightness is the confirmation.
+    private func scheduleBrightnessToGlasses() {
+        brightnessDebounceTask?.cancel()
+        brightnessDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+            let level = store.get("bluetooth", "brightness") as? Int ?? 50
+            let auto = store.get("bluetooth", "auto_brightness") as? Bool ?? true
+            DeviceManager.shared.sgc?.setBrightness(level, autoMode: auto)
+        }
+    }
+
     private func scheduleDashboardHeightToGlasses() {
         dashboardHeightDebounceTask?.cancel()
         dashboardHeightDebounceTask = Task { @MainActor in
@@ -237,29 +258,10 @@ class DeviceStore {
         // BLUETOOTH:
 
         case ("bluetooth", "brightness"):
-            let b = value as? Int ?? 50
-            let auto = store.get("bluetooth", "auto_brightness") as? Bool ?? true
-            Task {
-                DeviceManager.shared.sgc?.setBrightness(b, autoMode: auto)
-                await DeviceManager.shared.sgc?.sendTextWall("Set brightness to \(b)%")
-                try? await Task.sleep(nanoseconds: 800_000_000) // 0.8 seconds
-                DeviceManager.shared.sgc?.clearDisplay()
-            }
+            scheduleBrightnessToGlasses()
 
         case ("bluetooth", "auto_brightness"):
-            let b = store.get("bluetooth", "brightness") as? Int ?? 50
-            let auto = value as? Bool ?? true
-            let autoBrightnessChanged = (oldValue as? Bool) != auto
-            Task {
-                DeviceManager.shared.sgc?.setBrightness(b, autoMode: auto)
-                if autoBrightnessChanged {
-                    await DeviceManager.shared.sgc?.sendTextWall(
-                        auto ? "Enabled auto brightness" : "Disabled auto brightness"
-                    )
-                    try? await Task.sleep(nanoseconds: 800_000_000) // 0.8 seconds
-                    DeviceManager.shared.sgc?.clearDisplay()
-                }
-            }
+            scheduleBrightnessToGlasses()
 
         case ("bluetooth", "dashboard_height"):
             scheduleDashboardHeightToGlasses()

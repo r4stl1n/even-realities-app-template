@@ -760,6 +760,13 @@ private enum G2SettingProto {
         return w.data
     }
 
+    // NOTE: DeviceReceiveInfoFromAPP is a ONEOF in the firmware — the settings
+    // parser stores a single selector case and dispatches it once (descriptor
+    // `case 3 -> selector oneof 1..11`, selector loaded from `[r4,#0x0C]`).
+    // Never pack two settings into one package: protobuf oneof semantics keep
+    // only the last field on the wire, so the earlier one is silently dropped.
+    // Each setter below sends exactly one sub-message.
+
     /// Set screen depth (X coordinate level, 0-2)
     static func setScreenDepth(magicRandom: Int32, level: Int32) -> Data {
         // DeviceReceive_X_Coordinate
@@ -802,6 +809,8 @@ private enum ModuleConfigureProto {
 
     /// Sentinel `autoCloseValue` meaning "never auto-close" (firmware constant).
     static let autoCloseDisabled: Int32 = 0xFF55
+    /// Longest timer the firmware accepts; it validates `<= 240` or the sentinel.
+    static let autoCloseMaxSeconds = 240
 
     /// APP_SET_DASHBOARD_AUTO_CLOSE_VALUE — `seconds` is the dwell time before
     /// the dashboard closes itself; pass `autoCloseDisabled` to keep it up.
@@ -1608,6 +1617,12 @@ class G2: NSObject, SGCManager {
     private var menuAppIdToPackageName: [Int32: String] = [:]
     /// Dashboard menu items (stored for re-send on connect)
     private var dashboardMenuItems: [MenuProto.MenuItem] = []
+    /// Coalesced re-send that keeps the two arms on the same screen position
+    /// (see `setDashboardPosition`).
+    private var positionConfirmTask: Task<Void, Never>?
+    /// Reads the dashboard auto-close value back after a write so the log shows
+    /// what the glasses actually stored.
+    private var autoCloseReadbackTask: Task<Void, Never>?
     /// Current appId to associate EvenHub pages with (enables menu selection events)
     /// Set to the first menu item's appId so glasses know our page belongs to the menu
     private var activeMenuAppId: Int32?
@@ -1763,7 +1778,17 @@ class G2: NSObject, SGCManager {
     // making progress). Rate-limited. Prefixed "BGCAP:" so it's easy to grep/strip after validation.
     private var bgcapDepthLogAt: Double = 0
 
-    private func sendToGlasses(_ packets: [Data], left: Bool = false, right: Bool = true) {
+    /// Write to one or both arms. Both parameters are required on purpose: the
+    /// old `left: false, right: true` default silently made every new service
+    /// right-only, which is how the display-position setting ended up applied
+    /// to one lens and left the wearer looking at a misaligned image.
+    ///
+    /// Rule of thumb — per-arm device state (display offsets, brightness,
+    /// wakeword, dashboard config, auth) goes to BOTH; rendered content goes to
+    /// the RIGHT arm, which relays it to the left over the inter-eye UART.
+    /// Duplicating content would double BLE traffic on a paced queue and
+    /// produce two ack streams for one logical write.
+    private func sendToGlasses(_ packets: [Data], left: Bool, right: Bool) {
         if right {
             rightWriteQueue.append(contentsOf: packets)
             startDrain(right: true)
@@ -1843,7 +1868,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Right arm only: content — relayed to the left arm by the right (master).
+        sendToGlasses(packets, left: false, right: true)
     }
 
     private func sendG2SettingCommand(_ payload: Data) {
@@ -1852,7 +1878,12 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Both arms: each side drives its own lens, so a display-position or
+        // brightness change applied to only the right arm leaves the left one
+        // on the old value. `sendToGlasses` defaults to right-only, which is
+        // fine for query/telemetry traffic but wrong for per-lens settings —
+        // the dashboard service already sends to both for the same reason.
+        sendToGlasses(packets, left: true, right: true)
     }
 
     private func sendModuleConfigureCommand(_ payload: Data) {
@@ -1861,7 +1892,9 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Both arms, matching the dashboard service: this configures dashboard
+        // behaviour, and each arm runs its own copy of the dashboard UI.
+        sendToGlasses(packets, left: true, right: true)
     }
 
     private func sendOnboardingCommand(_ payload: Data) {
@@ -1870,7 +1903,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Both arms: each arm keeps its own onboarding flag.
+        sendToGlasses(packets, left: true, right: true)
     }
 
     private func sendEvenAICommand(_ payload: Data) {
@@ -1879,7 +1913,9 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Both arms: the wakeword listens on each arm's own mic, so the
+        // enable flag has to be set on both or one side keeps listening.
+        sendToGlasses(packets, left: true, right: true)
     }
 
     private func sendNotificationCommand(_ payload: Data) {
@@ -1888,7 +1924,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Right arm only: content — relayed to the left arm by the right (master).
+        sendToGlasses(packets, left: false, right: true)
     }
 
     private func sendMenuCommand(_ payload: Data) {
@@ -1897,7 +1934,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Right arm only: content — relayed to the left arm by the right (master).
+        sendToGlasses(packets, left: false, right: true)
     }
 
     private func sendGestureCtrlCommand(_ payload: Data) {
@@ -1906,7 +1944,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Right arm only: inbound-event channel; our writes are acks/config for the master.
+        sendToGlasses(packets, left: false, right: true)
     }
 
     private func sendEvenHubCtrlCommand(_ payload: Data) {
@@ -1915,7 +1954,8 @@ class G2: NSObject, SGCManager {
             payload: payload,
             reserveFlag: true
         )
-        sendToGlasses(packets)
+        // Right arm only: EvenHub control channel, owned by the master arm.
+        sendToGlasses(packets, left: false, right: true)
     }
 
     private func sendDashboardCommand(_ payload: Data) {
@@ -1993,7 +2033,11 @@ class G2: NSObject, SGCManager {
         self.sendToGlasses(
             self.sendManager.buildPackets(
                 serviceId: 0x0C, payload: uiSettW.data, reserveFlag: true
-            )
+            ),
+            // Right arm only: this is a read of the master's settings snapshot.
+            // Querying both would return two replies for one request.
+            left: false,
+            right: true
         )
 
         // 6. Dashboard init (0x01) — display settings
@@ -2001,8 +2045,12 @@ class G2: NSObject, SGCManager {
         // temperatureUnit: 1 = Celsius (metric), 2 = Fahrenheit (imperial)
         var dashDisplayW = ProtobufWriter()
         dashDisplayW.writeInt32Field(1, 4)  // displayMode
-        dashDisplayW.writeInt32Field(2, 3)  // statusDisplayCount
-        dashDisplayW.writeMessageField(3, Data([1, 2, 3]))  // statusDisplayOrder
+        // StatusType: 1=Weather, 2=Message, 3=Power, 4=Health. Weather is
+        // omitted on purpose — the widget is fed by a phone→glasses push that
+        // this app has no source for, and asking for the slot without feeding
+        // it is what renders the crossed-out "no data" weather icon.
+        dashDisplayW.writeInt32Field(2, 2)  // statusDisplayCount
+        dashDisplayW.writeMessageField(3, Data([2, 3]))  // statusDisplayOrder: Message, Power
         dashDisplayW.writeInt32Field(4, 4)  // widgetDisplayCount
         // WidgetType: 1=News, 2=Stock, 3=Schedule, 4=Quicklist, 5=Health
         dashDisplayW.writeMessageField(5, Data([3, 1, 2, 4, 5]))  // widgetDisplayOrder: Schedule, News, Stock, Quicklist
@@ -3365,8 +3413,12 @@ class G2: NSObject, SGCManager {
     func sendDashboardDisplaySettings() {
         var dashDisplayW = ProtobufWriter()
         dashDisplayW.writeInt32Field(1, 4)  // displayMode
-        dashDisplayW.writeInt32Field(2, 3)  // statusDisplayCount
-        dashDisplayW.writeMessageField(3, Data([1, 2, 3]))  // statusDisplayOrder
+        // StatusType: 1=Weather, 2=Message, 3=Power, 4=Health. Weather is
+        // omitted on purpose — the widget is fed by a phone→glasses push that
+        // this app has no source for, and asking for the slot without feeding
+        // it is what renders the crossed-out "no data" weather icon.
+        dashDisplayW.writeInt32Field(2, 2)  // statusDisplayCount
+        dashDisplayW.writeMessageField(3, Data([2, 3]))  // statusDisplayOrder: Message, Power
         dashDisplayW.writeInt32Field(4, 4)  // widgetDisplayCount
         // WidgetType: 1=News, 2=Stock, 3=Schedule, 4=Quicklist, 5=Health
         dashDisplayW.writeMessageField(5, Data([3, 1, 2, 4, 5]))
@@ -3461,29 +3513,63 @@ class G2: NSObject, SGCManager {
     }
 
     func setDashboardPosition(_ height: Int, _ depth: Int) {
-        Bridge.log("G2: setDashboardPosition(height=\(height), depth=\(depth))")
-        setDashboardHeightOnly(height)
-        setDashboardDepthOnly(depth)
+        let h = Int32(min(max(height, 0), 12))
+        let d = Int32(min(max(depth, 0), 2))
+        Bridge.log("G2: setDashboardPosition(height=\(h), depth=\(d))")
+        sendScreenPosition(h, d)
+
+        // Keep the arms in lock step. The same packet bytes go to both queues,
+        // but each side drains independently and writes are `.withoutResponse`
+        // with no per-arm ack or retry — one dropped packet leaves that lens at
+        // the old offset, which reads as misaligned/disorienting rather than as
+        // a failure. Repeat once so both sides converge on the same value.
+        // Coalesced: holding the stepper sends one confirmation for the value
+        // you land on, not one per tap.
+        positionConfirmTask?.cancel()
+        positionConfirmTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.sendScreenPosition(h, d)
+
+            // The offset only lands on the NEXT rendered frame. In the G2
+            // firmware the X/Y settings selectors write a single byte into the
+            // settings context and return — unlike the selectors that commit
+            // through the apply routine — so nothing repaints on receipt. A
+            // change made while the dashboard is already on screen therefore
+            // looks like it did nothing. Re-raise the dashboard so it redraws
+            // at the new offset.
+            if self.dashboardShowing > 0 {
+                self.showDashboard()
+            }
+        }
     }
 
-    func setDashboardHeightOnly(_ height: Int) {
-        let clamped = Int32(min(max(height, 0), 12))
-        Bridge.log("G2: setDashboardHeightOnly(\(clamped))")
-        let msg = G2SettingProto.setScreenHeight(
-            magicRandom: sendManager.nextMagicRandom(),
-            level: clamped
+    /// Two packages, one setting each. The firmware's settings message is a
+    /// oneof, so Y and X cannot share a package — see the note on the builders.
+    private func sendScreenPosition(_ height: Int32, _ depth: Int32) {
+        sendG2SettingCommand(
+            G2SettingProto.setScreenHeight(
+                magicRandom: sendManager.nextMagicRandom(), level: height
+            )
         )
-        sendG2SettingCommand(msg)
+        sendG2SettingCommand(
+            G2SettingProto.setScreenDepth(
+                magicRandom: sendManager.nextMagicRandom(), level: depth
+            )
+        )
+    }
+
+    // The single-axis entries re-send the other axis from the store so both
+    // coordinates stay in sync — each still goes out as its own package.
+
+    func setDashboardHeightOnly(_ height: Int) {
+        let depth = DeviceStore.shared.get("bluetooth", "dashboard_depth") as? Int ?? 2
+        setDashboardPosition(height, depth)
     }
 
     func setDashboardDepthOnly(_ depth: Int) {
-        let clamped = Int32(min(max(depth, 0), 2))
-        Bridge.log("G2: setDashboardDepthOnly(\(clamped))")
-        let msg = G2SettingProto.setScreenDepth(
-            magicRandom: sendManager.nextMagicRandom(),
-            level: clamped
-        )
-        sendG2SettingCommand(msg)
+        let height = DeviceStore.shared.get("bluetooth", "dashboard_height") as? Int ?? 4
+        setDashboardPosition(height, depth)
     }
 
     func setBrightness(_ level: Int, autoMode: Bool) {
@@ -3739,6 +3825,10 @@ class G2: NSObject, SGCManager {
     }
 
     func cleanup() {
+        positionConfirmTask?.cancel()
+        positionConfirmTask = nil
+        autoCloseReadbackTask?.cancel()
+        autoCloseReadbackTask = nil
         disconnect()
     }
 
@@ -3984,8 +4074,12 @@ class G2: NSObject, SGCManager {
 
         var dashDisplayW = ProtobufWriter()
         dashDisplayW.writeInt32Field(1, 4)  // displayMode
-        dashDisplayW.writeInt32Field(2, 3)  // statusDisplayCount
-        dashDisplayW.writeMessageField(3, Data([1, 2, 3]))  // statusDisplayOrder
+        // StatusType: 1=Weather, 2=Message, 3=Power, 4=Health. Weather is
+        // omitted on purpose — the widget is fed by a phone→glasses push that
+        // this app has no source for, and asking for the slot without feeding
+        // it is what renders the crossed-out "no data" weather icon.
+        dashDisplayW.writeInt32Field(2, 2)  // statusDisplayCount
+        dashDisplayW.writeMessageField(3, Data([2, 3]))  // statusDisplayOrder: Message, Power
         dashDisplayW.writeInt32Field(4, Int32(widgetOrder.count))  // widgetDisplayCount
         dashDisplayW.writeMessageField(5, Data(widgetOrder))  // widgetDisplayOrder: Schedule first
         dashDisplayW.writeInt32Field(6, dashboardHalfDayFormat())  // halfDayFormat
@@ -4025,18 +4119,32 @@ class G2: NSObject, SGCManager {
     /// Set how long the dashboard stays up before the firmware closes it and
     /// blanks the lens. `seconds <= 0` means never auto-close.
     func setDashboardAutoCloseSeconds(_ seconds: Int) {
+        // The firmware accepts a timer of at most 240s, or the 0xFF55 sentinel
+        // for "never". Anything above 240 is out of contract and gets dropped,
+        // which reads as the setting being ignored.
         let value =
             seconds <= 0
             ? ModuleConfigureProto.autoCloseDisabled
-            : Int32(clamping: seconds)
+            : Int32(min(seconds, ModuleConfigureProto.autoCloseMaxSeconds))
         let msg = ModuleConfigureProto.setDashboardAutoClose(
             magicRandom: sendManager.nextMagicRandom(),
             seconds: value
         )
         sendModuleConfigureCommand(msg)
         Bridge.log(
-            "G2: setDashboardAutoCloseSeconds(\(seconds <= 0 ? "never" : "\(seconds)s"))"
+            "G2: setDashboardAutoCloseSeconds(\(seconds <= 0 ? "never" : "\(seconds)s")) sent value=\(value)"
         )
+
+        // Read the value straight back. The glasses answer an inquire with what
+        // they actually stored, so the log tells us whether the write landed —
+        // and whether the firmware kept our units — rather than leaving us
+        // guessing when the dashboard doesn't close.
+        autoCloseReadbackTask?.cancel()
+        autoCloseReadbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.requestDashboardAutoClose()
+        }
     }
 
     /// Ask the glasses for their current dashboard auto-close value. The reply
@@ -5029,8 +5137,11 @@ class G2: NSObject, SGCManager {
             }
         }
 
+        // Anything else: dump it raw. If the glasses answer an inquire in a
+        // shape we don't expect, that payload is the evidence needed to fix it.
         Bridge.log(
-            "G2: module_configure response cmd=\(cmd) fields=\(Array(fields.keys).sorted())"
+            "G2: module_configure response cmd=\(cmd) fields=\(Array(fields.keys).sorted()) "
+                + "raw=\(payload.map { String(format: "%02X", $0) }.joined())"
         )
     }
 
@@ -5108,6 +5219,17 @@ class G2: NSObject, SGCManager {
             Bridge.log("G2: dashboard toggle - dashboardShowing=\(dashboardShowing) opening=\(dashboardOpening)")
             if dashboardOpening {
                 dashboardOpening = false  // open confirmed; dashboard now owns the screen
+                dashboardShowing = 1
+                return
+            }
+            // The event is a genuine toggle, so treat it as one. The latch above
+            // only covers dashboards WE open via showDashboard(); when the wearer
+            // opens it by looking up, the firmware raises it on its own and this
+            // is the OPEN. Assuming close here rebuilt our page and snatched the
+            // screen straight back — the dashboard flashed up, vanished, and
+            // stayed unreachable until the user closed our page by hand.
+            if dashboardShowing == 0 {
+                dashboardShowing = 1
                 return
             }
             dashboardShowing = 0

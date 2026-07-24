@@ -356,6 +356,61 @@ public final class MentraBluetoothSDK {
         try await setDashboardPosition(height: request.height, depth: request.depth)
     }
 
+    /// Display brightness, 0–100. Ignored by the glasses while auto-brightness
+    /// is on.
+    public var brightness: Int {
+        DeviceStore.shared.get(ObservableStore.bluetoothCategory, "brightness") as? Int ?? 50
+    }
+
+    /// Set the display brightness. Debounced, so dragging a slider results in
+    /// one write once the value settles.
+    public func setBrightnessLevel(_ level: Int) {
+        DeviceStore.shared.apply(
+            ObservableStore.bluetoothCategory, "brightness", min(max(level, 0), 100)
+        )
+    }
+
+    /// Whether the glasses adjust brightness from their ambient light sensor.
+    public var autoBrightness: Bool {
+        DeviceStore.shared.get(ObservableStore.bluetoothCategory, "auto_brightness") as? Bool ?? true
+    }
+
+    /// Enable/disable auto-brightness. Shares one protobuf field with the
+    /// manual level, so both are pushed together.
+    public func setAutoBrightnessEnabled(_ enabled: Bool) {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "auto_brightness", enabled)
+    }
+
+    /// How far the image sits from the wearer (the firmware's screen-depth /
+    /// X-coordinate level). G2 accepts 0–2; 0 is nearest.
+    public var displayDistance: Int {
+        DeviceStore.shared.get(ObservableStore.bluetoothCategory, "dashboard_depth") as? Int ?? 2
+    }
+
+    /// Set the display distance. Applies immediately when connected and is
+    /// re-applied on every reconnect.
+    public func setDisplayDistance(_ level: Int) {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "dashboard_depth", level)
+    }
+
+    /// Vertical position of the image (the firmware's screen-height /
+    /// Y-coordinate level). G2 accepts 0–12.
+    public var displayHeight: Int {
+        DeviceStore.shared.get(ObservableStore.bluetoothCategory, "dashboard_height") as? Int ?? 4
+    }
+
+    /// Set the display height. Applies immediately when connected and is
+    /// re-applied on every reconnect.
+    public func setDisplayHeight(_ level: Int) {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "dashboard_height", level)
+    }
+
+    /// Head tilt, in degrees, at which the glasses raise the head-up display.
+    /// G2 accepts 0–60.
+    public var headUpAngle: Int {
+        DeviceStore.shared.get(ObservableStore.bluetoothCategory, "head_up_angle") as? Int ?? 30
+    }
+
     /// Whether the "Hey Even" voice wakeword is enabled on the glasses (G2).
     public var heyEvenEnabled: Bool {
         DeviceStore.shared.get(ObservableStore.bluetoothCategory, "hey_even_enabled") as? Bool
@@ -430,6 +485,13 @@ public final class MentraBluetoothSDK {
     }
 
     public func setHeadUpAngle(_ angleDegrees: Int) async throws {
+        DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "head_up_angle", angleDegrees)
+    }
+
+    /// Set the head-up trigger angle without the async/throws ceremony — the
+    /// store write is synchronous and can't fail. Applies immediately when
+    /// connected and is re-applied on every reconnect.
+    public func setHeadUpAngleLevel(_ angleDegrees: Int) {
         DeviceStore.shared.apply(ObservableStore.bluetoothCategory, "head_up_angle", angleDegrees)
     }
 

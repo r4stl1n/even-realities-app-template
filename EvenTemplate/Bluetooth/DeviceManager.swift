@@ -858,9 +858,10 @@ class DeviceManager: NSObject {
             // stale/torn-down connection.
             guard let sgc = self?.sgc else { return }
             let h = DeviceStore.shared.get("bluetooth", "dashboard_height") as? Int ?? 4
-            // Fall back to the canonical default (2), matching DeviceStore — not 1.
-            let rawDepth = DeviceStore.shared.get("bluetooth", "dashboard_depth") as? Int ?? 2
-            let d = min(max(rawDepth, 1), 4)
+            let d = DeviceStore.shared.get("bluetooth", "dashboard_depth") as? Int ?? 2
+            // Pass through unclamped: the driver owns the valid range (G2 is 0–12
+            // height / 0–2 depth). Clamping to 1–4 here silently rewrote a stored
+            // depth of 0 to 1 on every reconnect.
             sgc.setDashboardPosition(h, d)
         }
 

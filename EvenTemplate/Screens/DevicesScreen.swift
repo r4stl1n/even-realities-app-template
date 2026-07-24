@@ -7,9 +7,15 @@ struct DevicesScreen: View {
     @State private var hideBuiltinMenuApps = true
     @State private var splashSeconds = 2
     @State private var dashboardAutoClose = -1
+    @State private var brightness = 50.0
+    @State private var autoBrightness = true
+    @State private var displayDistance = 2
+    @State private var displayHeight = 4
+    @State private var headUpAngle = 30
 
     /// Dashboard auto-close choices. -1 leaves the glasses' own value alone,
-    /// 0 is the firmware's "never close" sentinel.
+    /// 0 is the firmware's "never close" sentinel, and 240s is the longest
+    /// timer the firmware accepts.
     private static let autoCloseOptions: [(seconds: Int, label: String)] = [
         (-1, "Glasses default"),
         (0, "Never"),
@@ -19,7 +25,7 @@ struct DevicesScreen: View {
         (30, "30s"),
         (60, "1m"),
         (120, "2m"),
-        (300, "5m"),
+        (240, "4m"),
     ]
 
     private static let supportedModels: [(model: DeviceModel, label: String, note: String)] = [
@@ -97,6 +103,48 @@ struct DevicesScreen: View {
                 }
             }
 
+            Section("Display") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Auto brightness", isOn: $autoBrightness)
+                    Text("Let the glasses set brightness from their ambient light sensor.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Brightness")
+                        Spacer()
+                        Text("\(Int(brightness))%")
+                            .foregroundColor(.secondary)
+                    }
+                    Slider(value: $brightness, in: 0...100, step: 5)
+                        .disabled(autoBrightness)
+                    Text(autoBrightness
+                         ? "Turn off auto brightness to set the level by hand."
+                         : "Applies as you drag; the write is debounced so only the value you land on is sent.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Stepper("Distance: \(displayDistance)", value: $displayDistance, in: 0...2)
+                    Text("How far the image sits from you (0 = nearest, 2 = furthest). Applies immediately while connected.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Stepper("Height: \(displayHeight)", value: $displayHeight, in: 0...12)
+                    Text("Where the image sits vertically in the lens (0 = lowest, 12 = highest). Applies immediately while connected.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Stepper("Head-up angle: \(headUpAngle)\u{00B0}", value: $headUpAngle, in: 0...60, step: 5)
+                    Text("How far you tilt your head back before the display raises. Lower triggers sooner.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             Section("Glasses settings") {
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Dashboard auto-close", selection: $dashboardAutoClose) {
@@ -156,6 +204,26 @@ struct DevicesScreen: View {
             hideBuiltinMenuApps = session.sdk.builtinMenuAppsHidden
             splashSeconds = session.sdk.splashDurationSeconds
             dashboardAutoClose = session.sdk.dashboardAutoCloseSeconds
+            brightness = Double(session.sdk.brightness)
+            autoBrightness = session.sdk.autoBrightness
+            displayDistance = session.sdk.displayDistance
+            displayHeight = session.sdk.displayHeight
+            headUpAngle = session.sdk.headUpAngle
+        }
+        .onChange(of: brightness) { level in
+            session.sdk.setBrightnessLevel(Int(level))
+        }
+        .onChange(of: autoBrightness) { enabled in
+            session.sdk.setAutoBrightnessEnabled(enabled)
+        }
+        .onChange(of: displayDistance) { level in
+            session.sdk.setDisplayDistance(level)
+        }
+        .onChange(of: displayHeight) { level in
+            session.sdk.setDisplayHeight(level)
+        }
+        .onChange(of: headUpAngle) { degrees in
+            session.sdk.setHeadUpAngleLevel(degrees)
         }
         .onChange(of: dashboardAutoClose) { seconds in
             session.sdk.setDashboardAutoCloseSeconds(seconds)
