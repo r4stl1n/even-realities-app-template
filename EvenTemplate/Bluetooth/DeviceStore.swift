@@ -56,6 +56,8 @@ class DeviceStore {
         store.set("glasses", "caseCharging", false)
         store.set("glasses", "caseBatteryLevel", -1)
         store.set("glasses", "headUp", false)
+        // True while the glasses dashboard owns the screen (G2).
+        store.set("glasses", "screenOccupied", false)
         store.set("glasses", "serialNumber", "")
         store.set("glasses", "style", "")
         store.set("glasses", "color", "")

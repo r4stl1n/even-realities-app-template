@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import os.log
 
 /// Internal event bus for the Bluetooth stack: drivers publish named events with
 /// a `[String: Any]` payload, and `MentraBluetoothSDK` registers the sink that
@@ -77,7 +78,16 @@ class Bridge {
         }
     }
 
+    /// Subsystem/category mirror `BleTraceLogger` so both streams filter the
+    /// same way in Console.app and Xcode.
+    private static let osLog = OSLog(subsystem: "com.mentra.bluetoothsdk", category: "EvenTemplate")
+
     static func log(_ message: String) {
+        // Emit to the unified log as well as the event bus. This used to only
+        // dispatch to sinks — a leftover from the Expo bridge, where logs were
+        // consumed by JavaScript — which meant every Bridge.log in the codebase
+        // was invisible in Xcode and only BLE_TRACE (os_log) showed up.
+        os_log("%{public}@", log: osLog, type: .info, message)
         let data = ["message": message]
         Bridge.sendTypedMessage("log", body: data)
     }

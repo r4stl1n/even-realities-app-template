@@ -1515,7 +1515,15 @@ class G2: NSObject, SGCManager {
     private var isDisconnecting = false
     private var pairingTimeoutTimer: DispatchWorkItem?
     private var useEvenDashboard = true
-    private var dashboardShowing = 0
+    private var dashboardShowing = 0 {
+        didSet {
+            guard dashboardShowing != oldValue else { return }
+            // Mirror to the store so the app can tell the user why a feature
+            // that needs our EvenHub page (the glasses mic) can't start: while
+            // the dashboard owns the screen the firmware refuses to create it.
+            DeviceStore.shared.set("glasses", "screenOccupied", dashboardShowing > 0)
+        }
+    }
     // The 08011A00 gesture_ctrl event is ambiguous: the firmware sends it BOTH when the dashboard
     // opens (it shuts our page down to take the screen) and when it closes (returns to us). When
     // showDashboard() runs we set this latch; the next 08011A00 is the OPEN confirm — consume it
@@ -3125,6 +3133,22 @@ class G2: NSObject, SGCManager {
             // Bridge.log("G2: recover(\(reason)) skipped — page alive, mic matches intent")
             return
         }
+
+        // Only take the screen back if we actually need it. The dashboard is
+        // what the glasses show when no page is up, so rebuilding an empty page
+        // here snatched the screen the instant the wearer raised the dashboard —
+        // it appeared, vanished, and stayed unreachable until the page was closed
+        // by hand. With nothing to draw and no mic wanted, leave the screen alone;
+        // the ordinary display and mic paths build the page on demand when we do
+        // need it, so this cannot strand us without one.
+        let hasVisibleContent =
+            textContainers.contains {
+                !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } || imageContainers.contains { !$0.bmpData.isEmpty }
+        if !micIntent && !hasVisibleContent {
+            Bridge.log("G2: recover(\(reason)) skipped — nothing to show, mic off; leaving screen")
+            return
+        }
         if recoveryInFlight {
             // Bridge.log("G2: recover(\(reason)) skipped — already in flight")
             return
@@ -3531,16 +3555,13 @@ class G2: NSObject, SGCManager {
             guard !Task.isCancelled, let self else { return }
             self.sendScreenPosition(h, d)
 
-            // The offset only lands on the NEXT rendered frame. In the G2
-            // firmware the X/Y settings selectors write a single byte into the
-            // settings context and return — unlike the selectors that commit
-            // through the apply routine — so nothing repaints on receipt. A
-            // change made while the dashboard is already on screen therefore
-            // looks like it did nothing. Re-raise the dashboard so it redraws
-            // at the new offset.
-            if self.dashboardShowing > 0 {
-                self.showDashboard()
-            }
+            // NOTE: do not re-raise the dashboard here to force a repaint. This
+            // used to call showDashboard() whenever dashboardShowing > 0, but
+            // setDashboardPosition also runs on every connect — so the splash
+            // handed the screen to the dashboard, this re-raised it 250ms later,
+            // and every later position write raised it again. The dashboard
+            // never went away. The offset lands on the next frame the firmware
+            // draws on its own.
         }
     }
 
@@ -3693,18 +3714,21 @@ class G2: NSObject, SGCManager {
             // Dashboard owns the screen + session right now — don't arm the mic into a
             // page the dashboard has taken over; recovery re-arms on dashboard close.
             if useNativeDashboard && dashboardShowing > 0 {
+                Bridge.log("G2: restartMic — skipped, dashboard owns the screen")
                 return
             }
             // Never send audioControl(enable:true) without a live page — no page means no
             // mic. Rebuild first, which itself re-arms the mic at the end (intent is on),
             // so we're done.
             if !self.pageCreated {
+                Bridge.log("G2: restartMic — still no page, rebuilding")
                 Task { [weak self] in
                     await self?.rebuildState()
                     DeviceManager.shared.sendCurrentState()
                 }
                 return
             }
+            Bridge.log("G2: restartMic — arming mic")
             let msg = EvenHubProto.audioControlMessage(enable: true)
             self.sendEvenHubCommand(msg)
             self.evenHubMicActive = true
@@ -3716,7 +3740,30 @@ class G2: NSObject, SGCManager {
     func setMicEnabled(_ enabled: Bool) {
         Bridge.log("G2: setMicEnabled(\(enabled))")
         if enabled && !pageCreated {
-            restartMic()
+            // The mic only exists inside a live EvenHub page, so record the
+            // intent and build the page — `rebuildState()` arms the mic at the
+            // end once the page is up.
+            //
+            // This used to call restartMic(), which bounced through
+            // off → 0.5s → rebuild → (nested restart) → off → 0.5s → on before
+            // the mic actually armed. Any interruption in that ~1s chain left
+            // the mic silent until the user toggled a second time. It matters
+            // more now that the boot splash hands the display to the dashboard,
+            // which tears our page down — so the FIRST enable after every
+            // connect takes this path.
+            DeviceStore.shared.apply("glasses", "micEnabled", true)
+            Bridge.log(
+                "G2: mic enable with no page — dashboardShowing=\(dashboardShowing), "
+                    + "evenHubMicActive=\(evenHubMicActive); rebuilding page to host the mic"
+            )
+            Task { [weak self] in
+                await self?.rebuildState()
+                DeviceManager.shared.sendCurrentState()
+                Bridge.log(
+                    "G2: mic page rebuild done — pageCreated=\(self?.pageCreated ?? false), "
+                        + "evenHubMicActive=\(self?.evenHubMicActive ?? false)"
+                )
+            }
             return
         }
         let currentEnabled = DeviceStore.shared.get("glasses", "micEnabled") as? Bool ?? false
@@ -5219,19 +5266,14 @@ class G2: NSObject, SGCManager {
             Bridge.log("G2: dashboard toggle - dashboardShowing=\(dashboardShowing) opening=\(dashboardOpening)")
             if dashboardOpening {
                 dashboardOpening = false  // open confirmed; dashboard now owns the screen
-                dashboardShowing = 1
                 return
             }
-            // The event is a genuine toggle, so treat it as one. The latch above
-            // only covers dashboards WE open via showDashboard(); when the wearer
-            // opens it by looking up, the firmware raises it on its own and this
-            // is the OPEN. Assuming close here rebuilt our page and snatched the
-            // screen straight back — the dashboard flashed up, vanished, and
-            // stayed unreachable until the user closed our page by hand.
-            if dashboardShowing == 0 {
-                dashboardShowing = 1
-                return
-            }
+            // Always recover here. Treating this as a parity toggle (open when we
+            // think it's closed, close when we think it's open) desynced: the L/R
+            // dedup window above drops one of the paired events, so a missed one
+            // flips parity, a real CLOSE gets read as an OPEN, our page is never
+            // rebuilt, and the dashboard is stuck on screen with nothing able to
+            // take it back. A spurious rebuild is recoverable; a stuck screen is not.
             dashboardShowing = 0
             recoverPageAndMic(reason: "dashboard-close")
             return

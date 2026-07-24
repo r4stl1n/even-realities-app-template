@@ -356,6 +356,13 @@ public final class MentraBluetoothSDK {
         try await setDashboardPosition(height: request.height, depth: request.depth)
     }
 
+    /// True while the glasses' own dashboard owns the screen. Features that
+    /// need our EvenHub page — notably the glasses microphone — cannot start
+    /// until it closes, because the firmware refuses to create the page.
+    public var glassesScreenOccupied: Bool {
+        DeviceStore.shared.get("glasses", "screenOccupied") as? Bool ?? false
+    }
+
     /// Display brightness, 0–100. Ignored by the glasses while auto-brightness
     /// is on.
     public var brightness: Int {
@@ -529,13 +536,16 @@ public final class MentraBluetoothSDK {
         sendTranscript: Bool = false,
         sendLc3Data: Bool = false
     ) {
-        if enabled {
-            DeviceStore.shared.apply(
-                ObservableStore.bluetoothCategory,
-                "preferred_mic",
-                useGlassesMic ? MicPreference.glasses.rawValue : MicPreference.phone.rawValue
-            )
-        }
+        // Record the source preference unconditionally. Gating this on `enabled`
+        // meant flipping "use glasses mic" while the mic was OFF was silently
+        // dropped: the preference never reached the store, the mic then came up
+        // on whatever source was set before, and only toggling again — with the
+        // mic already running — actually switched it. That is the double-toggle.
+        DeviceStore.shared.apply(
+            ObservableStore.bluetoothCategory,
+            "preferred_mic",
+            useGlassesMic ? MicPreference.glasses.rawValue : MicPreference.phone.rawValue
+        )
         applyMicState(
             sendPcmData: enabled,
             sendTranscript: enabled && sendTranscript,

@@ -824,9 +824,14 @@ class DeviceManager: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self else { return }
             checkCurrentAudioDevice()
+            // Re-evaluate the mic here rather than immediately. iOS reports an
+            // empty `availableInputs` mid-transition, so running this on the
+            // raw notification made updateMicState() see no usable input and
+            // log "No available mic found!" while the mic was in fact still
+            // recording — and a route change fires right after the mic starts,
+            // which is exactly when the first enable happens.
+            updateMicState()
         }
-
-        updateMicState()
     }
 
     func onInterruption(began: Bool) {
